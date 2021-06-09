@@ -1,0 +1,267 @@
+#!/bin/bash
+
+BASE_DIR="."
+PORT=80
+MODE="serve"
+REQUEST=""
+REQ_METHOD=""
+REQ_PATH=""
+REQ_HTTP_VERS=""
+RESP_MIME_TYPE=""
+RESP_CONTENT_LENGTH=""
+RESP_BODY=""
+RESP_CODE=""
+DISABLE_DIR_LST="false"
+STORED_ARGS="$@"
+declare -A MIME_TYPES=(
+    [css]="text/css"
+    [js]="application/javascript"
+    [json]="application/json"
+    [yaml]="text/yaml"
+    [yml]="text/yaml"
+    [toml]="text/toml"
+    [xml]="application/xml"
+)
+
+function displayHelp() {
+    cat << EOF
+NAME:
+    $(basename $0) -- bash- and socat-only file server
+USAGE:
+    $0 [options]
+OPTIIONS:
+    -p|--listen-port                    Port to listen on
+    -b|--base-directory                 Base directory to serve from
+    -d|--disable-directory-listing      Disable listing content of directories
+    -h|--help                           Print this help
+EOF
+    exit 1
+
+}
+
+function log() {
+    echo "[$0] time=\"$(date +"%Y-%m-%dT%H:%M:%SZ")\" $@" 1>&2
+}
+
+function rawurlencode() {
+    local length="${#1}"
+    for (( i = 0; i < length; i++ )); do
+        local c="${1:i:1}"
+        case $c in 
+        [/a-zA-Z0-9.~_-] ) printf "$c" ;;
+        *) printf "$c" | xxd -p -c1 | while read x;do printf "%%%s" "$x";done
+    esac
+done
+}
+
+function rawurldecode() {
+    printf -v REPLY '%b' "${1//%/\\x}"
+    echo "${REPLY}"
+}
+
+function parseArgs() {
+    while [[ $# -gt 0 ]]
+    do
+        case "$1" in
+            -h|--help)
+            displayHelp
+            shift
+            ;;
+            -p|--listen-port)
+            PORT="$2"
+            shift
+            shift
+            ;;
+            -b|--base-directory)
+            BASE_DIR="$2"
+            shift
+            shift
+            ;;
+            -d|--disable-directory-listing)
+            DISABLE_DIR_LST="true"
+            shift
+            ;;
+            *)
+            MODE="$1"
+            shift
+            ;;
+        esac
+    done
+    BASE_DIR="$(realpath "${BASE_DIR}")"
+}
+
+function readRequest() {
+    while read -n 10000 line
+    do
+        REQUEST="${REQUEST}${line}"
+        parseRequest
+        if [ "${REQ_METHOD}" != "" ] && [ "${REQ_PATH}" != "" ]
+        then
+            return
+        fi
+    done
+}
+
+function parseRequest() {
+    regex='(GET|POST|PUT|DELETE|OPTION|HEAD) (/.*)(\?.*)? (HTTP/[0-9].[0-9]).*'
+    [[ $REQUEST =~ $regex ]]
+    REQ_METHOD="${BASH_REMATCH[1]}"
+    REQ_PATH="$(rawurldecode "${BASH_REMATCH[2]}" | sed 's:/+:/:')"
+    REQ_HTTP_VERS="${BASH_REMATCH[4]}"
+}
+
+function serve() {
+    log "msg=\"Start serving :${PORT}\""
+    socat -T 10 tcp-listen:${PORT},fork,reuseaddr system:"$0 file ${STORED_ARGS}"
+}
+
+function generateFolderHTML() {
+    folder="${BASE_DIR}/${REQ_PATH}"
+    echo "<html><head><meta charset=\"utf-8\"><link rel=\"stylesheet\" href=\"https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.3/css/all.min.css\"/><title>Content of ${REQ_PATH}</title>"
+    echo "<style>h1 {font-weight: 400;font-size: 3rem;}li {list-style: none;}ul {padding-left: 3rem;}a:hover {color: #cccccc;}a {transition: color 0.2s ease-in-out 0s;}i.fa::before,i.far::before {margin-right: 12px;min-width: 20px;display: inline-block;color: white;}body,a {color: white;}body {display: flex;flex-direction: column;font-size: 13pt;padding: 1.5rem 6rem 1.5rem 6rem;background-color: #4f5e75;}</style>"
+    echo "</head><body><h1>Content of ${REQ_PATH}</h1><ul>"
+    while read -r line
+    do
+        case "$line" in
+            d*)
+                dir=$(echo $line | cut -d'"' -f2)
+                link=$(rawurlencode "${REQ_PATH%/}/${dir}")
+                echo "<li><i class=\"fa fa-folder\"></i><a href=\"${link}\">${dir}</a></li>"
+                ;;
+            -*)
+                file=$(echo $line | cut -d'"' -f2)
+                link=$(rawurlencode "${REQ_PATH%/}/${file}")
+                echo "<li><i class=\"far fa-file\"></i><a href=\"${link}\">${file}</a></li>"
+                ;;
+            *)
+                ;;
+        esac
+    done <<< "$(ls -laQ ${folder})"
+    echo "</ul></body></html>"
+}
+
+function fileinfo() {
+    file="$(realpath "${BASE_DIR}/${REQ_PATH}")"
+    log "$file"
+    if [[ ! "${file}" =~ ^${BASE_DIR}.* ]]
+    then
+        RESP_CODE="403"
+        return
+    fi
+    if [ -e "${file}" ]
+    then
+        if [ -d "${file}" ]
+        then
+            if [ "${DISABLE_DIR_LST}" == "true" ]
+            then
+                RESP_CODE="404"
+                return
+            else
+                RESP_MIME_TYPE="text/html"
+                RESP_BODY="$(generateFolderHTML)"
+                RESP_CONTENT_LENGTH=$(echo ${RESP_BODY} | wc -c )
+            fi
+        else
+            RESP_MIME_TYPE=$(file --mime-type -b "$file")
+            if [ "${RESP_MIME_TYPE}" == "text/plain" ]
+            then
+                extension=$(echo ${file##*.} | tr '[:upper:]' '[:lower:]')
+                if [ "${MIME_TYPES[${extension}]}" != "" ]
+                then
+                    RESP_MIME_TYPE="${MIME_TYPES[${extension}]}"
+                fi
+            fi
+            RESP_CONTENT_LENGTH=$(ls -l "${file}" | tr -s ' ' | cut -f5 -d' ')
+        fi
+        RESP_CODE="200"
+    else
+        RESP_CODE="404"
+    fi
+}
+
+function respond() {
+    if [ "${REQ_METHOD}" != "GET" ]
+    then
+        RESP_CODE="405"
+    fi
+
+    log "code=\"${RESP_CODE}\" method=\"${REQ_METHOD}\" path=\"${REQ_PATH}\""
+    case "${RESP_CODE}" in
+        403)
+        cat << EOF
+HTTP/1.1 403 Forbidden
+Server: Bashy
+Content-Length: 93
+
+<html><head><title>403 - Forbidden</title></head><body><h1>403 - Forbidden</h1></body></html>
+EOF
+        ;;
+        404)
+        cat << EOF
+HTTP/1.1 404 Not Found
+Server: Bashy
+Content-Type: ${RESP_MIME_TYPE}
+Content-Length: 93
+
+<html><head><title>404 - Not found</title></head><body><h1>404 - Not found</h1></body></html>
+EOF
+        ;;
+        405)
+        cat << EOF
+HTTP/1.1 405 Method not allowed
+Server: Bashy
+Content-Length: 111
+
+<html><head><title>405 - Method not allowed</title></head><body><h1>405 - Method not allowed</h1></body></html>
+EOF
+        ;;
+        200)
+        cat << EOF
+HTTP/1.1 200 OK
+Server: Bashy
+Content-Type: ${RESP_MIME_TYPE}
+Content-Length: ${RESP_CONTENT_LENGTH}
+
+EOF
+        if [ "${#RESP_BODY}" != "0" ]
+        then
+            echo "${RESP_BODY}"
+        else
+            cat "${BASE_DIR}/${REQ_PATH}"
+        fi
+        ;;
+    esac
+}
+
+function check_deps() {
+    STH_MISSING="false"
+    for cmd in "socat" "file" "cat" "echo" "[[" "tr" "xxd"
+    do
+        command -v ${cmd} 2>&1 >/dev/null
+        if [ "$?" != "0" ]
+        then
+            echo "Command ${cmd} not found" 1>&2
+            STH_MISSING="true"
+        fi
+    done
+    if [ ${STH_MISSING} == "true" ]
+    then
+        exit 1
+    fi
+}
+
+
+function run() {
+    check_deps
+    parseArgs $@
+    if [ "${MODE}" == "serve" ]
+    then
+        serve
+    else
+        readRequest
+        fileinfo
+        respond
+    fi
+}
+
+run $@
