@@ -7,9 +7,9 @@ Et voilà, without further need to explain, here we go:
 
 ```
 NAME:
-    fileserver -- bash- and socat-only file server
+    SoFiE -- The Socat Fileserver Experiments
 USAGE:
-    ./fileserver [options]
+    ./sofie [options]
 OPTIIONS:
     -p|--listen-port                    Port to listen on
     -b|--base-directory                 Base directory to serve from
